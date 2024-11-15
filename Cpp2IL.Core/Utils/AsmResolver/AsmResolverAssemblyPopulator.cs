@@ -403,7 +403,7 @@ public static class AsmResolverAssemblyPopulator
 
             var signature = methodCtx.IsStatic ? MethodSignature.CreateStatic(returnType, parameterTypes) : MethodSignature.CreateInstance(returnType, parameterTypes);
 
-            var managedMethod = new MethodDefinition(methodCtx.MethodName, (MethodAttributes)methodCtx.Attributes, signature);
+            var managedMethod = new MethodDefinition(methodCtx.Name, (MethodAttributes)methodCtx.Attributes, signature);
 
             if (methodCtx.Definition != null)
             {
@@ -524,6 +524,103 @@ public static class AsmResolverAssemblyPopulator
             eventCtx.PutExtraData("AsmResolverEvent", managedEvent);
 
             ilTypeDefinition.Events.Add(managedEvent);
+        }
+    }
+
+    public static void InferExplicitInterfaceImplementations(AssemblyAnalysisContext asmContext)
+    {
+        var managedAssembly = asmContext.GetExtraData<AssemblyDefinition>("AsmResolverAssembly") ?? throw new("AsmResolver assembly not found in assembly analysis context for " + asmContext);
+
+        var importer = managedAssembly.GetImporter();
+
+        foreach (var typeContext in asmContext.Types)
+        {
+            if (IsTypeContextModule(typeContext))
+                continue;
+
+            var managedType = typeContext.GetExtraData<TypeDefinition>("AsmResolverType") ?? throw new($"AsmResolver type not found in type analysis context for {typeContext.Definition?.FullName}");
+
+#if !DEBUG
+            try
+#endif
+            {
+                InferExplicitInterfaceImplementations(managedType, importer);
+            }
+#if !DEBUG
+            catch (Exception e)
+            {
+                throw new Exception($"Failed to process type {managedType.FullName} (module {managedType.Module?.Name}, declaring type {managedType.DeclaringType?.FullName}) in {asmContext.Definition.AssemblyName.Name}", e);
+            }
+#endif
+        }
+    }
+
+    private static void InferExplicitInterfaceImplementations(TypeDefinition type, ReferenceImporter importer)
+    {
+        foreach (var method in type.Methods)
+        {
+            if (Utf8String.IsNullOrEmpty(method.Name))
+                continue;
+
+            var periodLastIndex = method.Name.LastIndexOf('.');
+            if (periodLastIndex < 0 || !method.IsPrivate || !method.IsVirtual || !method.IsFinal || !method.IsNewSlot)
+            {
+                continue;
+            }
+
+            var methodName = method.Name.Value[(periodLastIndex + 1)..];
+            var interfaceName = method.Name.Value[..periodLastIndex];
+            var genericParameterNames = type.GenericParameters.Count > 0
+                ? type.GenericParameters.Select(p => (string?)p.Name ?? "").ToArray()
+                : [];
+            var interfaceType = AsmResolverUtils.TryLookupTypeSignatureByName(interfaceName, genericParameterNames);
+
+            if (interfaceType is null)
+                continue;
+
+            var ambiguous = false;
+            IMethodDefOrRef? interfaceMethod = null;
+            var underlyingInterface = interfaceType.GetUnderlyingTypeDefOrRef();
+            foreach (var interfaceMethodDef in (underlyingInterface as TypeDefinition)?.Methods ?? [])
+            {
+                if (interfaceMethodDef.Name != methodName)
+                    continue;
+
+                if (interfaceMethod is not null)
+                {
+                    // Ambiguity. Checking the method signature will be required to disambiguate.
+                    interfaceMethod = null;
+                    ambiguous = true;
+                    break;
+                }
+
+                // This has the implicit assumption that the method signatures match.
+                // This is a reasonable assumption because there's no other method to match (with this name).
+                interfaceMethod = new MemberReference(importer.ImportType(interfaceType.ToTypeDefOrRef()), interfaceMethodDef.Name, interfaceMethodDef.Signature);
+            }
+
+            if (ambiguous)
+            {
+                // Ambiguities are very rare, so we only bother signature checking when we have to.
+
+                var genericContext = GenericContext.FromType(interfaceType);
+                foreach (var interfaceMethodDef in (underlyingInterface as TypeDefinition)?.Methods ?? [])
+                {
+                    if (interfaceMethodDef.Name != methodName)
+                        continue;
+
+                    if (SignatureComparer.Default.Equals(method.Signature, interfaceMethodDef.Signature?.InstantiateGenericTypes(genericContext)))
+                    {
+                        interfaceMethod = new MemberReference(importer.ImportTypeOrNull(interfaceType?.ToTypeDefOrRef()), interfaceMethodDef.Name, interfaceMethodDef.Signature);
+                        break;
+                    }
+                }
+            }
+
+            if (interfaceMethod != null)
+            {
+                type.MethodImplementations.Add(new MethodImplementation(importer.ImportMethod(interfaceMethod), method));
+            }
         }
     }
 }
